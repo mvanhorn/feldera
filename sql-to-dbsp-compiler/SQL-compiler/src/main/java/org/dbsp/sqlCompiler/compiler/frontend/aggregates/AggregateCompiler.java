@@ -520,8 +520,9 @@ public class AggregateCompiler implements ICompilerComponent {
         DBSPExpression increment = this.incrementOperation(
                 node, opcode, accumulatorType, accumulator, aggregatedValue, this.filterArgument());
         DBSPTypeUser semigroup = new DBSPTypeUser(node, SEMIGROUP, semigroupName, false, accumulatorType);
-        DBSPClosureExpression postProcessing = ExpressionCompiler.expandTuple(node, accumulator.field(1))
-                .closure(accumulator);
+        var acc2 = accumulatorType.var();
+        DBSPClosureExpression postProcessing = ExpressionCompiler.expandTuple(node, acc2.field(1))
+                .closure(acc2);
 
         if (this.filterArgument >= 0) {
             aggregate = new NonLinearAggregate(
