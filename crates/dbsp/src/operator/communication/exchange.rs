@@ -19,13 +19,16 @@ use crate::{
         tokio::TOKIO,
     },
     circuit_cache_key,
+    storage::file::format::FixedLen,
 };
+use binrw::{BinRead, BinWrite};
 use crossbeam_utils::CachePadded;
-use futures::{future, prelude::*, stream::FuturesUnordered};
+use futures::{prelude::*, stream::FuturesUnordered};
 use itertools::Itertools;
 use std::{
     borrow::Cow,
     collections::HashMap,
+    io::{Cursor, ErrorKind},
     marker::PhantomData,
     net::SocketAddr,
     ops::Range,
@@ -35,17 +38,14 @@ use std::{
     },
     time::{Duration, Instant, SystemTime},
 };
-use tarpc::{
-    client, context,
-    serde_transport::tcp::{connect, listen},
-    server::{self, Channel},
-    tokio_serde::formats::Bincode,
-    tokio_util::sync::{CancellationToken, DropGuard},
-};
+use tarpc::tokio_util::sync::{CancellationToken, DropGuard};
 use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
     sync::{Notify, OnceCell as TokioOnceCell},
     time::sleep,
 };
+use tracing::warn;
 use typedmap::TypedMapKey;
 
 /// Current time in microseconds.
@@ -65,35 +65,122 @@ fn current_time_usecs() -> u64 {
 // be used instead.
 circuit_cache_key!(local ExchangeCacheId<T>(ExchangeId => Arc<Exchange<T>>));
 
-#[tarpc::service]
-trait ExchangeService {
+#[binrw::binrw]
+#[brw(little)]
+struct ExchangeHeader {
+    exchange_id: ExchangeId,
+    sender_start: u32,
+    sender_end: u32,
+    #[brw(align_after(16))]
+    data_len: u32,
+}
+
+impl FixedLen for ExchangeHeader {
+    const LEN: usize = 16;
+}
+
+impl ExchangeHeader {
+    fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut cursor = Cursor::new([0; Self::LEN]);
+        self.write_le(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), Self::LEN as u64);
+        cursor.into_inner()
+    }
+
+    fn from_bytes(bytes: &[u8; Self::LEN]) -> Self {
+        let mut cursor = Cursor::new(bytes);
+        let this = Self::read_le(&mut cursor).unwrap();
+        assert_eq!(cursor.position(), Self::LEN as u64);
+        this
+    }
+
+    async fn read<S>(stream: &mut S) -> std::io::Result<Option<Self>>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut buf = [0; Self::LEN];
+        match stream.read(&mut buf).await? {
+            0 => Ok(None),
+            n => {
+                stream.read_exact(&mut buf[n..]).await?;
+                Ok(Some(ExchangeHeader::from_bytes(&buf)))
+            }
+        }
+    }
+}
+
+struct ExchangeServiceClient {
+    receivers: Range<usize>,
+    stream: tokio::sync::Mutex<TcpStream>,
+}
+
+impl ExchangeServiceClient {
     /// Sends messages in `exchange_id` from all of the worker threads in
     /// `senders` to all of the worker thread receivers in the server that
     /// processes the message.  The Bincode-encoded message from `sender` to
     /// `receiver` is `data[sender - senders.start][receiver -
-    /// receivers.start]`, where `receivers` is the `Range<usize>` of worker
-    /// thread IDs in the server that processes the message.
-    async fn exchange(exchange_id: usize, senders: Range<usize>, data: Vec<Vec<Vec<u8>>>);
+    /// self.receivers.start]`.
+    async fn exchange(
+        &self,
+        exchange_id: ExchangeId,
+        senders: Range<usize>,
+        data: Vec<Vec<Vec<u8>>>,
+    ) -> std::io::Result<()> {
+        let mut stream = self.stream.lock().await;
+        let sender_start = senders.start.try_into().unwrap();
+        let sender_end = senders.end.try_into().unwrap();
+        for (sender, data) in senders.zip(data) {
+            for (receiver, data) in self.receivers.clone().zip(data) {
+                let header = ExchangeHeader {
+                    exchange_id,
+                    sender_start,
+                    sender_end,
+                    data_len: data.len().try_into().unwrap(),
+                }
+                .to_bytes();
+                stream.write_all(&header).await?;
+                stream.write_all(&data).await?;
+                let pad = data.len().next_multiple_of(16) - data.len();
+                stream.write_all(&[0; 16][..pad]).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
-type ExchangeId = usize;
+type ExchangeId = u32;
 
 // Maps from an `exchange_id` to the `Inner` that implements the exchange.
 type ExchangeDirectory = Arc<RwLock<HashMap<ExchangeId, Arc<InnerExchange>>>>;
 
-#[derive(Clone)]
-struct ExchangeServer(ExchangeDirectory);
+struct ExchangeServer {
+    receivers: Range<usize>,
+    directory: ExchangeDirectory,
+    stream: TcpStream,
+}
 
-impl ExchangeService for ExchangeServer {
-    async fn exchange(
-        self,
-        _: context::Context,
-        exchange_id: ExchangeId,
-        senders: Range<usize>,
-        data: Vec<Vec<Vec<u8>>>,
-    ) {
-        let inner = self.0.read().unwrap().get(&exchange_id).unwrap().clone();
-        inner.received(senders, data).await;
+impl ExchangeServer {
+    async fn serve(mut self) -> std::io::Result<()> {
+        while let Some(header) = ExchangeHeader::read(&mut self.stream).await? {
+            let senders = (header.sender_start as usize)..(header.sender_end as usize);
+            let mut data = Vec::with_capacity(senders.len());
+            let mut header = Some(header);
+            for sender in senders {
+                for receiver in self.receivers.clone() {
+                    let header = if let Some(header) = header.take() {
+                        header
+                    } else {
+                        ExchangeHeader::read(&mut self.stream)
+                            .await?
+                            .ok_or_else(|| std::io::Error::from(ErrorKind::UnexpectedEof))?
+                    };
+
+                    let payload = Vec::with_capacity(header.data_len as usize);
+                    self.stream.read_exact(buf);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -146,11 +233,9 @@ impl Clients {
             .find(|(host, _client)| host.workers.contains(&worker))
             .unwrap();
         cell.get_or_init(|| async {
-            let transport = loop {
-                let mut transport = connect(host.address, Bincode::default);
-                transport.config_mut().max_frame_length(usize::MAX);
-                match transport.await {
-                    Ok(transport) => break transport,
+            let stream = loop {
+                match TcpStream::connect(host.address).await {
+                    Ok(stream) => break stream,
                     Err(error) => println!(
                         "connection to {} failed ({error}), waiting to retry",
                         host.address
@@ -158,7 +243,9 @@ impl Clients {
                 }
                 sleep(std::time::Duration::from_millis(1000)).await;
             };
-            ExchangeServiceClient::new(client::Config::default(), transport).spawn()
+            stream.set_nodelay(true).unwrap();
+            stream.set_linger(Some(Duration::ZERO)).unwrap();
+            todo!()
         })
         .await
     }
@@ -430,10 +517,6 @@ pub(crate) struct Exchange<T> {
     deserialized_bytes: AtomicUsize,
 }
 
-async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
-    tokio::spawn(fut);
-}
-
 // Stop Rust from complaining about unused field.
 #[allow(dead_code)]
 struct ExchangeListener(DropGuard);
@@ -444,20 +527,17 @@ impl ExchangeListener {
         let drop = token.clone().drop_guard();
         TOKIO.spawn(async move {
             println!("listening on {address}");
-            let mut listener = listen(address, Bincode::default).await.unwrap();
-            listener.config_mut().max_frame_length(usize::MAX);
-            let incoming = listener
-                .filter_map(|r| future::ready(r.ok()))
-                .map(server::BaseChannel::with_defaults)
-                .map(move |channel| {
-                    let server = ExchangeServer(directory.clone());
-                    channel.execute(server.serve()).for_each(spawn)
-                })
-                .buffer_unordered(10)
-                .for_each(|_| async {});
-            tokio::select! {
-                _ = incoming => {}
-                _ = token.cancelled() => {}
+            let listener = TcpListener::bind(address).await.unwrap();
+            while let Some(stream) = tokio::select! {
+                stream = listener.accept() => Some(stream),
+                _ = token.cancelled() => None,
+            } {
+                match stream {
+                    Ok((stream, _address)) => {
+                        tokio::spawn(ExchangeServer(directory.clone()).serve())
+                    }
+                    Err(error) => warn!("Error accepting connection from {address}: {error}"),
+                }
             }
         });
         Self(drop)
@@ -668,14 +748,7 @@ where
                 let client = this.inner.clients.connect(receivers.start).await;
 
                 // Send it.
-                let mut context = context::current();
-                context.deadline = Instant::now() + Duration::from_hours(1);
-                futures.push(client.exchange(
-                    context,
-                    this.inner.exchange_id,
-                    senders.clone(),
-                    items,
-                ));
+                futures.push(client.exchange(this.inner.exchange_id, senders.clone(), items));
             }
 
             // Wait for all the sends to complete.
@@ -1308,7 +1381,7 @@ where
     let runtime = Runtime::runtime().unwrap();
     let worker_index = Runtime::worker_index();
 
-    let exchange_id = runtime.sequence_next();
+    let exchange_id = runtime.sequence_next().try_into().unwrap();
     let start_wait_usecs = Arc::new(AtomicU64::new(0));
     let exchange = Exchange::with_runtime(
         &runtime,

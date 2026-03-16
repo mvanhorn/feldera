@@ -129,7 +129,7 @@ where
                 circuit.region("accumulate_trace_with_balancer", || {
                     // Exchange + receiver
                     let runtime = Runtime::runtime().unwrap();
-                    let exchange_id = runtime.sequence_next();
+                    let exchange_id = runtime.sequence_next().try_into().unwrap();
                     let worker_index = Runtime::worker_index();
                     let batch_factories_clone = batch_factories.clone();
                     let start_wait_usecs = Arc::new(AtomicU64::new(0));

@@ -1006,7 +1006,7 @@ impl Consensus {
         match Runtime::runtime() {
             Some(runtime) if Runtime::num_workers() > 1 => {
                 let worker_index = Runtime::worker_index();
-                let exchange_id = runtime.sequence_next();
+                let exchange_id = runtime.sequence_next().try_into().unwrap();
                 let exchange = Exchange::with_runtime(
                     &runtime,
                     exchange_id,
@@ -1095,7 +1095,7 @@ where
         match Runtime::runtime() {
             Some(runtime) if Runtime::num_workers() > 1 => {
                 let worker_index = Runtime::worker_index();
-                let exchange_id = runtime.sequence_next();
+                let exchange_id = runtime.sequence_next().try_into().unwrap();
                 let exchange = Exchange::with_runtime(
                     &runtime,
                     exchange_id,
