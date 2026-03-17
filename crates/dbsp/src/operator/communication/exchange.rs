@@ -230,6 +230,9 @@ impl ExchangeServer {
 struct Clients {
     runtime: WeakRuntime,
 
+    /// Cached `runtime.layout().local_workers()`.
+    local_workers: Range<usize>,
+
     /// Listens for connections from other hosts.
     ///
     /// We create this lazily upon the first attempt to connect to other hosts.
@@ -246,6 +249,7 @@ struct Clients {
 impl Clients {
     fn new(runtime: &Runtime) -> Clients {
         Self {
+            local_workers: runtime.layout().local_workers(),
             runtime: runtime.downgrade(),
             listener: Default::default(),
             clients: runtime
@@ -267,7 +271,7 @@ impl Clients {
                 Some(ExchangeListener::new(
                     local_address,
                     directory,
-                    runtime.layout().local_workers(),
+                    self.local_workers.clone(),
                 ))
             } else {
                 None
@@ -291,8 +295,11 @@ impl Clients {
                 sleep(std::time::Duration::from_millis(1000)).await;
             };
             stream.set_nodelay(true).unwrap();
-            stream.set_linger(Some(Duration::ZERO)).unwrap();
-            todo!()
+            stream.set_zero_linger().unwrap();
+            ExchangeServiceClient {
+                receivers: self.local_workers.clone(),
+                stream: tokio::sync::Mutex::new(stream),
+            }
         })
         .await
     }
