@@ -132,16 +132,18 @@ pub(crate) struct CommittedSpine {
     pub dirty: bool,
 }
 
-/// Trait for data that can be serialized and deserialized with [`rkyv`].
-///
-/// This trait doesn't have any extra bounds on Deserializable.
-///
 /// Deserializes `bytes` as type `T` using `rkyv`, tolerating `bytes` being
 /// misaligned.
 pub fn unaligned_deserialize<T: Deserializable>(bytes: &[u8]) -> T {
     let mut aligned_bytes = FBuf::new();
     aligned_bytes.extend_from_slice(bytes);
-    unsafe { archived_root::<T>(&aligned_bytes[..]) }
+    aligned_deserialize(&aligned_bytes)
+}
+
+/// Deserializes `bytes` as type `T` using `rkyv`.  `bytes` must be properly
+/// aligned.
+pub fn aligned_deserialize<T: Deserializable>(bytes: &[u8]) -> T {
+    unsafe { archived_root::<T>(bytes) }
         .deserialize(&mut Deserializer::default())
         .unwrap()
 }

@@ -25,11 +25,13 @@ use binrw::{BinRead, BinWrite};
 use crossbeam_utils::CachePadded;
 use futures::{prelude::*, stream::FuturesUnordered};
 use itertools::Itertools;
+use rkyv::AlignedVec;
 use std::{
     borrow::Cow,
     collections::HashMap,
-    io::{Cursor, ErrorKind},
+    io::{Cursor, ErrorKind, IoSlice},
     marker::PhantomData,
+    mem::MaybeUninit,
     net::SocketAddr,
     ops::Range,
     sync::{
@@ -126,23 +128,46 @@ impl ExchangeServiceClient {
         senders: Range<usize>,
         data: Vec<Vec<Vec<u8>>>,
     ) -> std::io::Result<()> {
-        let mut stream = self.stream.lock().await;
-        let sender_start = senders.start.try_into().unwrap();
-        let sender_end = senders.end.try_into().unwrap();
-        for (sender, data) in senders.zip(data) {
-            for (receiver, data) in self.receivers.clone().zip(data) {
-                let header = ExchangeHeader {
+        // We want to write each data buffer preceded by a header and followed
+        // by padding.  To minimize the system calls required to do this, we
+        // assemble them into one big collection of IoSlices.  First, create the
+        // headers.
+        let n = senders.len() * self.receivers.len();
+        let mut headers = Vec::with_capacity(n);
+        for data in data.iter().flatten() {
+            headers.push(
+                ExchangeHeader {
                     exchange_id,
-                    sender_start,
-                    sender_end,
+                    sender_start: senders.start.try_into().unwrap(),
+                    sender_end: senders.end.try_into().unwrap(),
                     data_len: data.len().try_into().unwrap(),
                 }
-                .to_bytes();
-                stream.write_all(&header).await?;
-                stream.write_all(&data).await?;
-                let pad = data.len().next_multiple_of(16) - data.len();
-                stream.write_all(&[0; 16][..pad]).await?;
+                .to_bytes(),
+            );
+        }
+
+        let zeros = [0; 16];
+
+        // Now that we've got the headers, assemble the IoSlices.
+        let mut slices = Vec::with_capacity(n * 3);
+        let mut header = headers.iter();
+        for data in data.iter().flatten() {
+            slices.push(IoSlice::new(header.next().unwrap()));
+            if !data.is_empty() {
+                slices.push(IoSlice::new(data.as_slice()));
             }
+            let pad = &zeros[..data.len().next_multiple_of(16) - data.len()];
+            if !pad.is_empty() {
+                slices.push(IoSlice::new(pad));
+            }
+        }
+
+        // Finally, send the whole assembly.
+        let mut bufs = slices.as_mut_slice();
+        let mut stream = self.stream.lock().await;
+        while !bufs.is_empty() {
+            let n = stream.write_vectored(bufs).await?;
+            IoSlice::advance_slices(&mut bufs, n);
         }
         Ok(())
     }
@@ -162,11 +187,19 @@ struct ExchangeServer {
 impl ExchangeServer {
     async fn serve(mut self) -> std::io::Result<()> {
         while let Some(header) = ExchangeHeader::read(&mut self.stream).await? {
+            let exchange = self
+                .directory
+                .read()
+                .unwrap()
+                .get(&header.exchange_id)
+                .unwrap_or_else(|| panic!("unknown exchange ID {}", header.exchange_id))
+                .clone();
             let senders = (header.sender_start as usize)..(header.sender_end as usize);
             let mut data = Vec::with_capacity(senders.len());
             let mut header = Some(header);
-            for sender in senders {
-                for receiver in self.receivers.clone() {
+            for _ in senders.clone() {
+                let mut receivers_data = Vec::with_capacity(self.receivers.len());
+                for _ in self.receivers.clone() {
                     let header = if let Some(header) = header.take() {
                         header
                     } else {
@@ -175,10 +208,20 @@ impl ExchangeServer {
                             .ok_or_else(|| std::io::Error::from(ErrorKind::UnexpectedEof))?
                     };
 
-                    let payload = Vec::with_capacity(header.data_len as usize);
-                    self.stream.read_exact(buf);
+                    let len = header.data_len as usize;
+                    let padded_len = len.next_multiple_of(16);
+                    let mut payload = AlignedVec::with_capacity(padded_len);
+                    let pointer = payload.as_mut_ptr() as *mut MaybeUninit<u8>;
+                    let mut slice = unsafe { std::slice::from_raw_parts_mut(pointer, padded_len) };
+                    while !slice.is_empty() {
+                        self.stream.read_buf(&mut slice).await?;
+                    }
+                    unsafe { payload.set_len(len) };
+                    receivers_data.push(payload);
                 }
+                data.push(receivers_data);
             }
+            tokio::spawn(async move { exchange.received(senders, data).await });
         }
         Ok(())
     }
@@ -221,7 +264,11 @@ impl Clients {
                 && let Some(local_address) = runtime.layout().local_address()
             {
                 let directory = runtime.local_store().get(&DirectoryId).unwrap().clone();
-                Some(ExchangeListener::new(local_address, directory))
+                Some(ExchangeListener::new(
+                    local_address,
+                    directory,
+                    runtime.layout().local_workers(),
+                ))
             } else {
                 None
             }
@@ -325,13 +372,13 @@ struct InnerExchange {
     sender_notifies: Vec<Notify>,
     /// A callback that takes the raw data exchanged over RPC and deserializes
     /// and delivers it to the receiver's mailbox.
-    deliver: Box<dyn Fn(Vec<u8>, usize, usize) + Send + Sync + 'static>,
+    deliver: Box<dyn Fn(AlignedVec, usize, usize) + Send + Sync + 'static>,
 }
 
 impl InnerExchange {
     fn new(
         exchange_id: ExchangeId,
-        deliver: impl Fn(Vec<u8>, usize, usize) + Send + Sync + 'static,
+        deliver: impl Fn(AlignedVec, usize, usize) + Send + Sync + 'static,
         clients: Arc<Clients>,
     ) -> InnerExchange {
         let runtime = Runtime::runtime().unwrap();
@@ -382,7 +429,7 @@ impl InnerExchange {
     /// all of the local worker threads `receivers` in `self`.  The
     /// Bincode-encoded `Vec<u8>` message from `sender` to `receiver` is
     /// `data[sender - senders.start][receiver - receivers.start]`.
-    async fn received(self: &Arc<Self>, senders: Range<usize>, data: Vec<Vec<Vec<u8>>>) {
+    async fn received(self: &Arc<Self>, senders: Range<usize>, data: Vec<Vec<AlignedVec>>) {
         let receivers = &self.local_workers;
 
         // Deliver all of the data into the exchange's mailboxes.
@@ -447,15 +494,16 @@ impl InnerExchange {
 
 #[derive(Clone, Debug)]
 pub enum Mailbox<T> {
-    Serialized(Vec<u8>),
+    Tx(Vec<u8>),
+    Rx(AlignedVec),
     Plain(T),
 }
 
 impl<T> Mailbox<T> {
-    fn into_serialized(self) -> Option<Vec<u8>> {
+    fn into_tx(self) -> Option<Vec<u8>> {
         match self {
-            Mailbox::Serialized(bytes) => Some(bytes),
-            Mailbox::Plain(_) => None,
+            Mailbox::Tx(bytes) => Some(bytes),
+            Mailbox::Rx(_) | Mailbox::Plain(_) => None,
         }
     }
 }
@@ -508,7 +556,7 @@ pub(crate) struct Exchange<T> {
     /// v         |-----|-----|-----|-----|
     /// ```
     mailboxes: Arc<Vec<Mutex<Option<Mailbox<T>>>>>,
-    deserialize: Box<dyn Fn(Vec<u8>) -> T + Send + Sync>,
+    deserialize: Box<dyn Fn(AlignedVec) -> T + Send + Sync>,
 
     /// The amount of time spent calling `deserialize`.
     deserialization_usecs: AtomicU64,
@@ -522,7 +570,7 @@ pub(crate) struct Exchange<T> {
 struct ExchangeListener(DropGuard);
 
 impl ExchangeListener {
-    fn new(address: SocketAddr, directory: ExchangeDirectory) -> Self {
+    fn new(address: SocketAddr, directory: ExchangeDirectory, receivers: Range<usize>) -> Self {
         let token = CancellationToken::new();
         let drop = token.clone().drop_guard();
         TOKIO.spawn(async move {
@@ -534,7 +582,14 @@ impl ExchangeListener {
             } {
                 match stream {
                     Ok((stream, _address)) => {
-                        tokio::spawn(ExchangeServer(directory.clone()).serve())
+                        tokio::spawn(
+                            ExchangeServer {
+                                receivers: receivers.clone(),
+                                directory: directory.clone(),
+                                stream,
+                            }
+                            .serve(),
+                        );
                     }
                     Err(error) => warn!("Error accepting connection from {address}: {error}"),
                 }
@@ -553,17 +608,17 @@ where
         exchange_id: ExchangeId,
         clients: Arc<Clients>,
         directory: ExchangeDirectory,
-        deserialize: Box<dyn Fn(Vec<u8>) -> T + Send + Sync>,
+        deserialize: Box<dyn Fn(AlignedVec) -> T + Send + Sync>,
     ) -> Self {
         let npeers = Runtime::num_workers();
         let mailboxes: Arc<Vec<Mutex<Option<Mailbox<T>>>>> =
             Arc::new((0..npeers * npeers).map(|_| Mutex::new(None)).collect());
         let mailboxes2 = mailboxes.clone();
-        let deliver = move |data: Vec<u8>, sender, receiver| {
+        let deliver = move |data, sender, receiver| {
             let index: usize = sender * npeers + receiver;
             let mut mailbox = mailboxes2[index].lock().unwrap();
             assert!((*mailbox).is_none());
-            *mailbox = Some(Mailbox::Serialized(data));
+            *mailbox = Some(Mailbox::Rx(data));
         };
 
         let inner = Arc::new(InnerExchange::new(exchange_id, deliver, clients));
@@ -598,7 +653,7 @@ where
     pub(crate) fn with_runtime(
         runtime: &Runtime,
         exchange_id: ExchangeId,
-        deserialize: Box<dyn Fn(Vec<u8>) -> T + Send + Sync>,
+        deserialize: Box<dyn Fn(AlignedVec) -> T + Send + Sync>,
     ) -> Arc<Self> {
         let directory = runtime
             .local_store()
@@ -653,7 +708,7 @@ where
             data.zip(WorkerLocations::new())
                 .map(|(data, location)| match location {
                     WorkerLocation::Local => Mailbox::Plain(data),
-                    WorkerLocation::Remote => Mailbox::Serialized(serialize(data)),
+                    WorkerLocation::Remote => Mailbox::Tx(serialize(data)),
                 }),
         )
     }
@@ -736,7 +791,7 @@ where
                                     .unwrap()
                                     .take()
                                     .unwrap()
-                                    .into_serialized()
+                                    .into_tx()
                                     .expect("remote mailboxes should always be serialized");
                                 serialized_bytes += serialized.len();
                                 serialized
@@ -805,7 +860,8 @@ where
                 .unwrap();
             let data = match mailbox {
                 Mailbox::Plain(item) => item,
-                Mailbox::Serialized(bytes) => {
+                Mailbox::Tx(_) => unreachable!(),
+                Mailbox::Rx(bytes) => {
                     self.deserialized_bytes
                         .fetch_add(bytes.len(), Ordering::Relaxed);
                     let start = Instant::now();
@@ -1117,10 +1173,11 @@ where
         let res = self.exchange.try_send_all(
             self.worker_index,
             self.outputs.drain(..).map(|mailbox| match mailbox {
-                Mailbox::Serialized(mut data) => {
+                Mailbox::Tx(mut data) => {
                     data.push(self.flushed as u8);
-                    Mailbox::Serialized(data)
+                    Mailbox::Tx(data)
                 }
+                Mailbox::Rx(_) => unreachable!(),
                 Mailbox::Plain(item) => Mailbox::Plain((item, self.flushed)),
             }),
         );
@@ -1372,7 +1429,7 @@ where
     TE: Send + 'static + Clone,
     IF: Fn() -> TO + 'static,
     PL: FnMut(TI, &mut Vec<Mailbox<TE>>) + 'static,
-    D: Fn(Vec<u8>) -> TE + Send + Sync + 'static,
+    D: Fn(AlignedVec) -> TE + Send + Sync + 'static,
     CL: Fn(&mut TO, TE) + 'static,
 {
     if Runtime::num_workers() == 1 {
@@ -1428,7 +1485,7 @@ mod tests {
             communication::{Mailbox, new_exchange_operators},
         },
         storage::file::{to_bytes, to_bytes_dyn},
-        trace::unaligned_deserialize,
+        trace::aligned_deserialize,
     };
     use std::{iter::repeat, thread::yield_now};
 
@@ -1450,7 +1507,7 @@ mod tests {
             let exchange = Exchange::with_runtime(
                 &Runtime::runtime().unwrap(),
                 0,
-                Box::new(|data| unaligned_deserialize(&data[..])),
+                Box::new(|data| aligned_deserialize(&data[..])),
             );
 
             for round in 0..ROUNDS {
@@ -1520,13 +1577,13 @@ mod tests {
                             for location in WorkerLocations::new() {
                                 match location {
                                     WorkerLocation::Local => vals.push(Mailbox::Plain(n)),
-                                    WorkerLocation::Remote => vals.push(Mailbox::Serialized(
-                                        to_bytes_dyn(&n).unwrap().into_vec(),
-                                    )),
+                                    WorkerLocation::Remote => {
+                                        vals.push(Mailbox::Tx(to_bytes_dyn(&n).unwrap().into_vec()))
+                                    }
                                 }
                             }
                         },
-                        |data| unaligned_deserialize(&data[..]),
+                        |data| aligned_deserialize(&data[..]),
                         |v: &mut Vec<usize>, n| v.push(n),
                     )
                     .unwrap();

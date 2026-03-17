@@ -288,7 +288,7 @@ where
     fn done(self) -> Mailbox<OB> {
         match self {
             ShardBuilder::Local(builder) => Mailbox::Plain(builder.done()),
-            ShardBuilder::Remote(serializer) => Mailbox::Serialized(serializer.done()),
+            ShardBuilder::Remote(serializer) => Mailbox::Tx(serializer.done()),
         }
     }
 }
@@ -422,7 +422,7 @@ where
     fn done(self) -> Mailbox<Box<DynPairs<K, V>>> {
         match self {
             PairsBuilder::Local(pairs) => Mailbox::Plain(pairs),
-            PairsBuilder::Remote(serializer) => Mailbox::Serialized(serializer.done()),
+            PairsBuilder::Remote(serializer) => Mailbox::Tx(serializer.done()),
         }
     }
 }

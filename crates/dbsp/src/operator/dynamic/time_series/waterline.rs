@@ -95,7 +95,7 @@ where
                                 waterlines.push(Mailbox::Plain(clone_box(waterline.as_ref())))
                             }
                             WorkerLocation::Remote => waterlines
-                                .push(Mailbox::Serialized(waterline.checkpoint().unwrap())),
+                                .push(Mailbox::Tx(waterline.checkpoint().unwrap())),
                         };
                     }
                 },
@@ -175,7 +175,7 @@ where
                                 waterlines.push(Mailbox::Plain(clone_box(waterline.as_ref())))
                             }
                             WorkerLocation::Remote => waterlines
-                                .push(Mailbox::Serialized(waterline.checkpoint().unwrap())),
+                                .push(Mailbox::Tx(waterline.checkpoint().unwrap())),
                         };
                     }
                 },

@@ -11,7 +11,7 @@ use crate::operator::communication::Exchange;
 use crate::storage::backend::StorageBackend;
 use crate::storage::file::format::Compression;
 use crate::storage::file::writer::Parameters;
-use crate::trace::unaligned_deserialize;
+use crate::trace::aligned_deserialize;
 use crate::{
     DetailedError,
     storage::{backend::StorageError, buffer_cache::BufferCache, dirlock::LockedDirectory},
@@ -1010,7 +1010,7 @@ impl Consensus {
                 let exchange = Exchange::with_runtime(
                     &runtime,
                     exchange_id,
-                    Box::new(|data| unaligned_deserialize(&data[..])),
+                    Box::new(|data| aligned_deserialize(&data[..])),
                 );
 
                 let notify_sender = Arc::new(Notify::new());

@@ -135,7 +135,7 @@ where
                                             batches.push(Mailbox::Plain(empty.clone()))
                                         }
                                         WorkerLocation::Remote => batches.push(
-                                            Mailbox::Serialized(serialize_indexed_wset(&empty)),
+                                            Mailbox::Tx(serialize_indexed_wset(&empty)),
                                         ),
                                     }
                                 }
@@ -148,7 +148,7 @@ where
                                     batches[receiver_worker] = Mailbox::Plain(batch);
                                 } else {
                                     batches[receiver_worker] =
-                                        Mailbox::Serialized(serialize_indexed_wset(&batch));
+                                        Mailbox::Tx(serialize_indexed_wset(&batch));
                                 }
                             },
                             move |data| deserialize_indexed_wset(&factories_clone, &data),
