@@ -201,12 +201,6 @@ public class MultiCrateTests extends BaseSQLTests {
         compileProgramToMultiCrate(sql, true);
     }
    
-    @Test @Ignore
-    public void testMultiCrateLarge() throws IOException, SQLException, InterruptedException {
-        File file = new File("../extra/current_pipeline.sql");
-        compileToMultiCrate(file.getAbsolutePath(), true);
-    }
-
     @Test
     public void testJoin() throws IOException, SQLException, InterruptedException {
         String sql = """
